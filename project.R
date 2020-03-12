@@ -44,7 +44,7 @@ lambda_j_t <- function(pij, r_t, incid, ws){
 ##' with n_days rows and n columns.
 ##' @author Sangeeta Bhatia
 ##' @export
-project <- function(incid, R, si, pij, n_days = 7){
+project <- function(incid, R, si, pij, size, n_days = 7){
 
     if (ncol(R) != ncol(incid)){
         stop("R should be a either a 1 X N or T X N matrix.")
@@ -71,12 +71,53 @@ project <- function(incid, R, si, pij, n_days = 7){
          ws <- rev(c(si, rep(0, end - length(si))))
     else ws <- rev(si)
     for (i in start:end){
-        i_t      <- out[1:i, ]
-        w_t      <- utils::tail(ws, i)
-        r_t      <- R[i - start + 1, ]
-        mu       <- lambda_j_t(pij, r_t, i_t, w_t)
-        out[i, ] <- rpois(n_loc, mu)
+        i_t <- out[1:i, ]
+        w_t <- utils::tail(ws, i)
+        r_t <- R[i - start + 1, ]
+        mu  <- lambda_j_t(pij, r_t, i_t, w_t)
+        ## not sure why, check project function in package
+        ## projections
+        size <- (w_t %*% i_t) * size
+        if (size == 0) size <- 1
+        out[i, ] <- stats::rnbinom(1, size = size, mu = mu)
     }
 
     out[start:nrow(out), ]
+}
+
+custom_join <- function(sim1, sim2) {
+    dplyr::left_join(sim1, sim2, by = "date")
+}
+
+
+project_sims <- function(nsim, I, R, si, pij, size, n_days, date_to_project_from) {
+    incid <- map(
+        1:nsim,
+        function(i) {
+            incid <- project(
+                incid = matrix(I, ncol = 1),
+                R = matrix(R, ncol = 1),
+                si = SI_Distr,
+                pij = matrix(1, nrow = 1, ncol = 1),
+                size = size,
+                n_days = n_days
+            )
+            out <- data.frame(
+                date = seq(
+                    from = as.Date(date_to_project_from),
+                    length.out = n_days,
+                    by = "1 day"
+                ),
+                sim = incid
+            )
+            out
+        }
+
+    )
+    incid <- Reduce(f = custom_join, x = incid)
+    ## colnames(incid)[3:length(incid)] <- paste0(
+    ##     "sim", length(3:length(incid))
+    ## )
+    incid
+
 }
