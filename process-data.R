@@ -3,7 +3,7 @@
 library(dplyr)
 library(ggplot2)
 library(purrr)
-
+source("project.R")
 ts <- readr::read_csv("john_hopkins_timeseries.csv")
 ts <- tidyr::gather(ts, key = date, value = cum_cases, `1/22/20`:`3/10/20`)
 ts$date <- lubridate::mdy(ts$date)
@@ -21,7 +21,9 @@ ggplot(aes(date, cum_cases, col = `Country/Region`)) +
 ## Daily Incidence
 
 by_country <- split(ts, ts$`Country/Region`)
-countries <- c("Italy", "Japan", "Iran (Islamic Republic of)", "France")
+countries <- c(
+    "Italy", "Japan", "Iran (Islamic Republic of)", "France", "UK", "Spain"
+)
 interesting <- by_country[countries]
 
 incidence <- purrr::map(
@@ -43,7 +45,7 @@ incidence <- purrr::map(
 si_mean <- 3.96
 si_std <- 4.75
 CV_SI <- si_std / si_mean
-SItrunc <- 60
+SItrunc <- 20
 
 SI_Distr <- sapply(
   0:SItrunc,
@@ -55,68 +57,161 @@ SI_Distr <- SI_Distr / sum(SI_Distr)
 ## # from Du et al. from The University of Texas at Austin and University of Hong Kong
 ## # (https://www.medrxiv.org/content/10.1101/2020.01.28.20019299v4.full.pdf)
 ## # (https://www.medrxiv.org/content/10.1101/2020.02.19.20025452v2.full.pdf)
-time_window <- 7
+time_window <- c(4, 8)
+names(time_window) <- time_window
 
-r0s <- purrr::map(
+r0s <- purrr::map_dfr(
     incidence,
     function(df) {
-        I <- df$cases
-        start <- 2:(nrow(x) - time_window)
-        end <- start + time_window
-        res <- EpiEstim::EstimateR(
-                             I,
-                             T.Start = start,
-                             T.End = end,
-                             method = "NonParametricSI",
-                             SI.Distr = SI_Distr,
-                             plot = FALSE,
-                             CV.Posterior = 1,
-                             Mean.Prior = 1,
-                             Std.Prior = 0.5
-                         )
-        res$R$date <- x$date[end]
-        res$R
-    }
+        out <- map_dfr(
+            time_window,
+            function(tw) {
+                I <- df$cases
+                start <- 2:(nrow(df) - tw)
+                end <- start + tw
+                res <- EpiEstim::EstimateR(
+                                     I,
+                                     T.Start = start,
+                                     T.End = end,
+                                     method = "NonParametricSI",
+                                     SI.Distr = SI_Distr,
+                                     plot = FALSE,
+                                     CV.Posterior = 1,
+                                     Mean.Prior = 1,
+                                     Std.Prior = 0.5
+                                 )
+                res$R$date <- df$date[end]
+                res$R
+            },
+          .id = "time_window"
+        )
+
+    }, .id = "country"
 )
 
+####
+
+ggplot() +
+    geom_line(
+        data = r0s, aes(x = date, y = `Median(R)`, col = time_window)
+    ) +
+    geom_ribbon(
+        data = r0s,
+        aes(
+            x = date,
+            ymin = `Quantile.0.025(R)`,
+            ymax = `Quantile.0.975(R)`,
+            fill = time_window
+            ),
+        alpha = 0.3
+    ) +
+    facet_wrap(~country, ncol = 1, scales = "free_y") +
+    theme_classic() +
+    theme(legend.position = "bottom")
 
 
+nsim <- 1000
 
+custom_join <- function(sim1, sim2) {
+    dplyr::left_join(sim1, sim2, by = "date")
+}
 
+r0s <- split(r0s, r0s$country)
+date_to_project_from <- "2020-03-03"
 ## Projections
-projections <- purrr::map2(
-    incidence, r0s,
-    function(df, r0) {
-        I <- df$cases
-        incid <- project(
-            incid = matrix(I, ncol = 1),
-            R = matrix(r0[["Median(R)"]][nrow(r0)], ncol = 1),
-            si = SI_Distr,
-            pij = matrix(1, nrow = 1, ncol = 1),
-            n_days = 7
+projections <- purrr::imap(
+    incidence,
+    function(df, country) {
+        country_r0 <- r0s[[country]]
+        country_r0_tw <- split(
+            country_r0, country_r0$time_window
+        )
+        ## Ger R0 around a week back and project for a period
+        ## that also has some observations.
+        country_r0_tw <- map(
+            country_r0_tw, ~ dplyr::filter(., date == date_to_project_from)
+        )
+        I <- df$cases[df$date <= as.Date(date_to_project_from)]
+        incid <- map_dfr(
+            country_r0_tw,
+            function(r0) {
+                incid <- map(
+                    1:nsim,
+                    function(i) {
+                        incid <- project(
+                            incid = matrix(I, ncol = 1),
+                            R = matrix(r0[["Median(R)"]][nrow(r0)], ncol = 1),
+                            si = SI_Distr,
+                            pij = matrix(1, nrow = 1, ncol = 1),
+                            n_days = 21
+                        )
+                        out <- data.frame(
+                            date = seq(
+                                from = as.Date(date_to_project_from),
+                                length.out = 21,
+                                by = "1 day"
+                            ),
+                            incid = incid
+                        )
+                        out
+                    }
+
+                )
+                incid <- Reduce(f = custom_join, x = incid)
+                incid
+        },
+        .id = "time_window"
+   )
+    }
+ )
+
+quantiles <- purrr::map(
+    projections,
+    function(x) {
+        qntls <- apply(
+            x[ , -c(1, 2)], 1, quantile, probs = c(0.025, 0.5, 0.975)
         )
         out <- data.frame(
-            date = seq(
-                from = tail(df$date, 1) + 1,
-                length.out = 7,
-                by = "1 day"
-            ),
-            incid = incid
+            date = x$date,
+            time_window = x$time_window,
+            q50  = qntls[2, ],
+            q025 = qntls[1, ],
+            q975 = qntls[3, ]
         )
         out
-
     }
-)
 
+
+)
 
 for (country in names(incidence)) {
 
-    p <- ggplot(incidence[[country]], aes(date, cases)) +
-        geom_col() +
-        geom_line(data = projections[[country]], aes(date, incid)) +
-        theme_classic()
+    p <- ggplot() +
+        geom_line(
+            data = incidence[[country]],
+            aes(date, cases)
+        ) +
+        geom_line(
+            data = quantiles[[country]],
+            aes(date, q50, col = time_window)
+        ) +
+        geom_ribbon(
+            data = quantiles[[country]],
+            aes(x = date, ymin = q025, ymax = q975, fill = time_window),
+            alpha = 0.3
+        ) +
+        theme_classic() +
+        theme(legend.position = "bottom")
+    plog <- p +
+        scale_y_log10(
+            breaks = scales::trans_breaks("log10", function(x) 10^x),
+            labels = scales::trans_format("log10", scales::math_format(10^.x))
+        ) +
+        annotation_logticks(sides = "l")
+
     outfile <- snakecase::to_snake_case(country)
     ggsave(glue::glue("{outfile}.pdf"), p)
+    ggsave(glue::glue("{outfile}_logscale.pdf"), plog)
 
 }
 
