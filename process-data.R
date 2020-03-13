@@ -258,15 +258,24 @@ rmse <- map2(
     incidence,
     projections,
     function(obs, pred) {
-        x <- tail(obs$cases, n_days)
+
+        dates_projected <- seq(
+                    from = as.Date(date_to_project_from),
+                    length.out = n_days,
+                    by = "1 day"
+        )
+        idx <- which(obs$date %in% dates_projected)
+        x <- obs$cases[idx]
+        pred <- pred[pred$date %in% obs$date, ]
         tw_y <- split(pred, pred$time_window)
         rel_mse <- map_dfr(
             tw_y,
             function(pred2) {
+                date <- pred2$date
                 pred2 <- as.matrix(pred2[ , -c(1, 2)])
                 out <- assessr::rel_mse(x, pred2)
                 out <- data.frame(
-                    date = tail(obs$date, n_days),
+                    date = date,
                     relmse = out
                 )
                 out$date <- as.Date(out$date)
@@ -288,11 +297,8 @@ for (country in names(incidence)) {
             aes(date, relmse, col = time_window)
         ) +
         theme_classic() +
-        theme(legend.position = "bottom") +
-        geom_vline(
-            xintercept = as.numeric(as.Date(date_to_project_from)),
-            linetype = 4
-        )
+        theme(legend.position = "bottom")
+
     plog <- p +
         scale_y_log10(
             breaks = scales::trans_breaks("log10", function(x) 10^x),
