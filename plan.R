@@ -84,9 +84,66 @@ plan <- drake_plan(
                 }
             )
         }
+    ),
+
+    ## Central estimates for each country for each
+    ## time window
+    qntls = purrr::map(
+        projections,
+        function(country) {
+           purrr::map_dfr(
+               country,
+               function(x) {
+                   out <- apply(x, 1, quantile, probs = 0.5)
+                   out <- as.data.frame(out)
+                   out <- tibble::rownames_to_column(out, var = "date")
+                   out
+               },
+               .id = "time_window"
+            )
+
+        }
+     ),
+
+    tables = purrr::map2(
+        incidence,
+        qntls,
+        function(obs, pred) {
+
+            pred$date <- as.Date(pred$date)
+            obs <- as.data.frame(obs)
+            x <- dplyr::full_join(
+                x = obs, y = pred, by = c("dates" = "date")
+                )
+            x <- na.omit(x)
+            x <- dplyr::arrange(x, time_window)
+
+        }
     )
 
-    ## RMSE
+    ## RMSE from median
+    rmse = purrr::map_dfr(
+        tables,
+        function(df) {
+            by_tw <- split(df, df$time_window)
+            out <- purrr::map_dfr(
+                by_tw,
+                function(both) {
 
+                    obs <- matrix(both$counts, ncol = 1)
+                    pred <- matrix(both$out, ncol = 1)
+                    err <- assessr::rel_mse(obs, pred)
+
+                    data.frame(
+                        date = df$date,
+                        rel_rmse = err
+                    )
+
+                }, .id = "time_window"
+            )
+            out
+        }, .id = "country"
+    )
 
 )
+
