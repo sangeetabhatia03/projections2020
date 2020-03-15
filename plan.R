@@ -119,10 +119,10 @@ plan <- drake_plan(
             x <- dplyr::arrange(x, time_window)
 
         }
-    )
+    ),
 
     ## RMSE from median
-    rmse = purrr::map_dfr(
+    rmae = purrr::map(
         tables,
         function(df) {
             by_tw <- split(df, df$time_window)
@@ -132,17 +132,17 @@ plan <- drake_plan(
 
                     obs <- matrix(both$counts, ncol = 1)
                     pred <- matrix(both$out, ncol = 1)
-                    err <- assessr::rel_mse(obs, pred)
+                    err <- assessr::rel_mae(obs, pred)
 
                     data.frame(
-                        date = df$date,
-                        rel_rmse = err
+                        date = both$date,
+                        rmae = err
                     )
 
                 }, .id = "time_window"
             )
             out
-        }, .id = "country"
+        }
     )
 
 )
