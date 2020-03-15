@@ -7,6 +7,7 @@ library(incidence)
 library(EpiEstim)
 library(epitrix)
 library(projections)
+library(cowplot)
 
 r_samples <- function(res, n = 1000) {
 
@@ -53,39 +54,6 @@ fix_manually <- function(ts) {
 
 }
 
-cum_epicurve <- function(ts) {
-
-    ggplot(ts,
-           aes(date, cum_cases, col = `Country/Region`)) +
-        geom_line() +
-        theme(legend.position = "none") +
-        theme_classic()
-
-}
-
-inurl <- "https://raw.githubusercontent.com/CSSEGISandData/COVID-19/master/csse_covid_19_data/csse_covid_19_time_series/time_series_19-covid-Confirmed.csv"
-
-countries_considered <- c(
-    "Italy", "Japan", "Iran (Islamic Republic of)",
-    "France", "UK", "Spain"
-)
-mean_si <- 3.96
-std_si <- 4.75
-size <- 0.16
-time_window <- c(4, 6, 8)
-names(time_window) <- time_window
-date_to_project_from <- "2020-03-03"
-n_sim <- 1000
-n_days <- 10
-
-SItrunc <- 20
-
-SI_Distr <- sapply(
-  0:SItrunc,
-  function(e) EpiEstim::discr_si(e, mean_si, std_si)
-)
-
-SI_Distr <- SI_Distr / sum(SI_Distr)
-
+source("params.R")
 source("plan.R")
 drake_config(plan)

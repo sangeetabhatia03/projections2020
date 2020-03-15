@@ -25,7 +25,7 @@ plan <- drake_plan(
         }
     ),
 
-    rts = map(
+    rts = purrr::map(
         incidence,
         function(df) {
             df <- subset(df, to = as.Date(date_to_project_from))
@@ -94,8 +94,8 @@ plan <- drake_plan(
            purrr::map_dfr(
                country,
                function(x) {
-                   out <- apply(x, 1, quantile, probs = 0.5)
-                   out <- as.data.frame(out)
+                   out <- apply(x, 1, quantile, probs = c(0.025, 0.5, 0.975))
+                   out <- as.data.frame(t(out))
                    out <- tibble::rownames_to_column(out, var = "date")
                    out
                },
@@ -121,8 +121,8 @@ plan <- drake_plan(
         }
     ),
 
-    ## RMSE from median
-    rmae = purrr::map(
+    ## RMAE from median
+    rmae = purrr::map_dfr(
         tables,
         function(df) {
             by_tw <- split(df, df$time_window)
@@ -131,7 +131,7 @@ plan <- drake_plan(
                 function(both) {
 
                     obs <- matrix(both$counts, ncol = 1)
-                    pred <- matrix(both$out, ncol = 1)
+                    pred <- matrix(both$`50%`, ncol = 1)
                     err <- assessr::rel_mae(obs, pred)
 
                     data.frame(
@@ -142,8 +142,124 @@ plan <- drake_plan(
                 }, .id = "time_window"
             )
             out
+        }, .id = "country"
+        ),
+
+    rmae_mean = dplyr::group_by(rmae, country, time_window) %>%
+        summarise(mean_rmae = mean(rmae)) %>%
+        ungroup(),
+    ## For each counrty, pick the time window that minimises
+    ## the error.
+
+    best_tw = split(rmae_mean, rmae_mean$country) %>%
+        purrr::map_dfr(function(x) x[which.min(x$mean_rmae), ]),
+
+    ## And for the best time window, extract projections
+
+    projections_best_tw = purrr::imap(
+        qntls,
+        function(qntl, cntry) {
+            tw <- best_tw$time_window[best_tw$country == cntry]
+            message("Best time window for ", cntry, " is ", tw)
+            qntl[qntl$time_window == tw, ]
         }
+     ),
+
+    ## For flexible plotting
+
+    incidence_df = purrr::map(
+        incidence, as.data.frame
+    ),
+
+    rt_best_tw =  purrr::imap(
+        rts,
+        function(rt, cntry) {
+            tw <- best_tw$time_window[best_tw$country == cntry]
+            message("Best time window for ", cntry, " is ", tw)
+            rt[[tw]]
+        }
+     ),
+
+    plots = purrr::walk(
+        countries_considered,
+        function(cntry) {
+
+            projections_best_tw[[cntry]]$date <- as.Date(
+                projections_best_tw[[cntry]]$date
+            )
+
+            limits <- c(
+                min(incidence_df[[cntry]]$dates),
+                max(projections_best_tw[[cntry]]$date)
+            )
+
+
+            message("Country ", cntry)
+
+            p <- ggplot() +
+                geom_col(
+                    data = incidence_df[[cntry]],
+                    aes(dates, counts)
+                )
+
+            p <- p +
+                geom_line(
+                    data = projections_best_tw[[cntry]],
+                    aes(date, `50%`)
+                ) +
+                geom_ribbon(
+                    data = projections_best_tw[[cntry]],
+                    aes(x = date, ymin = `2.5%`, ymax = `97.5%`),
+                    alpha = 0.3
+                ) + theme_classic() +
+                scale_x_date(limits = limits) +
+                xlab("") +
+                ylab("Daily Incidence") +
+                ggtitle(cntry)
+
+            rt <- rt_best_tw[[cntry]]
+            rt$date <- incidence_df[[cntry]]$dates[rt$t_start]
+            rt$date <- as.Date(rt$date)
+            rt_used <- tail(rt, 1)
+            rt_used <- rt_used[rep(seq_len(nrow(rt_used)), n_days), ]
+            rt_used$date <- seq(
+                from = tail(rt$date, 1) + 1,
+                length.out = n_days,
+                by = "1 day"
+            )
+            rt <- rbind(rt, rt_used)
+
+            p2 <- ggplot() +
+                geom_line(
+                    data = rt,
+                    aes(date, `Median(R)`)
+                ) +
+                geom_ribbon(
+                    data = rt,
+                    aes(x = date,
+                        ymin = `Quantile.0.025(R)`,
+                        ymax = `Quantile.0.975(R)`,
+                        ),
+                    alpha = 0.3
+                ) +
+                scale_x_date(limits = limits) +
+                theme_classic() +
+                xlab("")
+
+            p3 <- cowplot::plot_grid(
+                p, p2, nrow = 2, align="hv", rel_heights = c(2,1)
+            )
+
+            cowplot::save_plot(
+                filename = glue::glue("{cntry}.png"),
+                plot = p3
+            )
+
+        }
+
     )
+
+
 
 )
 
