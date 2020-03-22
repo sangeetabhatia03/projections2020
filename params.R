@@ -13,7 +13,7 @@ date_to_project_from <- "2020-03-08"
 n_sim <- 1000
 n_days <- 10
 
-SItrunc <- 20
+SItrunc <- 30
 
 SI_Distr <- sapply(
   0:SItrunc,
