@@ -1,49 +1,63 @@
 plan <- drake_plan(
 
-    raw_data = readr::read_csv(inurl) %>%
-        dplyr::filter(`Country/Region` != "Mainland China"),
+    raw_data = readr::read_rds(file_in(infile)),
 
-    tall_data = tidyr::gather(
-        raw_data, key = date, value = cum_cases, -(`Province/State`:Long)
-    ) %>%
-        mutate_at(vars("date"), lubridate::mdy) %>%
-        fix_manually() %>%
-        dplyr::count(
-        `Country/Region`, date, wt = cum_cases, name = "cum_cases"
+    deaths_to_use = raw_data[["D_active_transmission"]],
+
+    ## Convert to incidence object
+    tall_deaths = tidyr::gather(
+        deaths_to_use, key = country, value = deaths, -dates
+        ) %>%
+        split(.$country) %>%
+        purrr::map(~ ts_to_incid(
+                ts = ., date_col = "dates", case_col = "deaths"
+     )) %>%
+    ## Only keep those which have at least 7 days of non-zero deaths
+    ## Discuss with Pierre
+    keep(
+        function(x) (dim(x)[1] - first_nonzero_incidence(x)) >= 7
     ),
 
-    incidence = tall_data[tall_data$`Country/Region`
-                          %in%
-                          countries_considered, ] %>%
-        split(.$`Country/Region`) %>%
-        purrr::map(function(x) {
-            x$cases <- c(0, diff(x$cum_cases))
-            if (any(x$cases < 0)) message(x$`Country/Region`[1])
-            x <- tidyr::uncount(data = x, weight = cases)
-            x <- incidence(x$date)
-            x
+    si_distrs = purrr::map2(
+        raw_data[["si_mean"]],
+        raw_data[["si_std"]],
+        function(mu, sigma) {
+            reparams <- gamma_mucv2shapescale(
+                mu = mu,
+                cv = sigma / mu
+            )
+            miss_at_most <-0.001
+            cutoff <- ceiling(
+                qgamma(
+                    1 - miss_at_most,
+                    shape = reparams$shape,
+                    scale = reparams$scale
+                )
+            )
+
+            EpiEstim::discr_si(k = 0:cutoff, mu = mu, sigma = sigma)
+
         }
     ),
-
+    ######### Vanilla EpiEstim with 7 day window in the first ########
+    ######### instance.                                       ########
     rts = purrr::map(
-        incidence,
+        tall_deaths,
         function(df) {
             df <- subset(df, to = as.Date(date_to_project_from))
             out <- map(
-                time_window,
-                function(tw) {
+                si_distrs,
+                function(si_distr) {
                     ndays <- length(incidence::get_dates(df))
-                    eps <- windows_endpoints(ndays = ndays, tw = tw)
+                    eps <- windows_endpoints(df)
                     config <- make_config(
                         t_start = eps$t_start,
                         t_end = eps$t_end,
-                        ##si_distr = SI_Distr
-                        mean_si = mean_si,
-                        std_si = std_si
+                        si_distr = si_distr
                     )
                     res <- estimate_R(
                         df,
-                        method = "parametric_si",
+                        method = "non_parametric_si",
                         config = config
                     )
                     res$R
@@ -54,7 +68,6 @@ plan <- drake_plan(
     ),
 
     ## Samples from posterior distribution of R0
-
     rt_samples = map(
         rts,
         function(x) map(x, ~ r_samples(.))
@@ -64,17 +77,17 @@ plan <- drake_plan(
     ## negative-binomial offspring distribution
 
     projections = map2(
-        incidence,
+        tall_deaths,
         rt_samples,
         function(df, rt) {
             df <- subset(df, to = as.Date(date_to_project_from))
-            out <- map(
-                rt,
-                function(rt_tw) {
-                    project(
+            out <- map2(
+                rt, si_distrs,
+                function(rt_si, si) {
+                    projections::project(
                         x = df,
-                        R = rt_tw,
-                        si = SI_Distr,
+                        R = rt_si,
+                        si = si,
                         n_sim = n_sim,
                         n_days = n_days,
                         R_fix_within = TRUE,
@@ -84,6 +97,7 @@ plan <- drake_plan(
 
                 }
             )
+            out
         }
     ),
 
@@ -100,169 +114,107 @@ plan <- drake_plan(
                    out <- tibble::rownames_to_column(out, var = "date")
                    out
                },
-               .id = "time_window"
+               .id = "si_distr"
             )
 
         }
      ),
 
-    tables = purrr::map2(
-        incidence,
-        qntls,
-        function(obs, pred) {
-
-            pred$date <- as.Date(pred$date)
-            obs <- as.data.frame(obs)
-            x <- dplyr::full_join(
-                x = obs, y = pred, by = c("dates" = "date")
-                )
-            x <- na.omit(x)
-            x <- dplyr::arrange(x, time_window)
-
-        }
-    ),
-
-    ## RMAE from median
-    rmae = purrr::map_dfr(
-        tables,
-        function(df) {
-            by_tw <- split(df, df$time_window)
-            out <- purrr::map_dfr(
-                by_tw,
-                function(both) {
-
-                    obs <- matrix(both$counts, ncol = 1)
-                    pred <- matrix(both$`50%`, ncol = 1)
-                    err <- assessr::rel_mae(obs, pred)
-
-                    data.frame(
-                        date = both$date,
-                        rmae = err
-                    )
-
-                }, .id = "time_window"
-            )
-            out
-        }, .id = "country"
-        ),
-
-    rmae_mean = dplyr::group_by(rmae, country, time_window) %>%
-        summarise(mean_rmae = mean(rmae)) %>%
-        ungroup(),
-    ## For each counrty, pick the time window that minimises
-    ## the error.
-
-    best_tw = split(rmae_mean, rmae_mean$country) %>%
-        purrr::map_dfr(function(x) x[which.min(x$mean_rmae), ]),
-
-    ## And for the best time window, extract projections
-
-    projections_best_tw = purrr::imap(
-        qntls,
-        function(qntl, cntry) {
-            tw <- best_tw$time_window[best_tw$country == cntry]
-            message("Best time window for ", cntry, " is ", tw)
-            qntl[qntl$time_window == tw, ]
-        }
-     ),
-
-    ## For flexible plotting
-
-    incidence_df = purrr::map(
-        incidence, as.data.frame
-    ),
-
-    rt_best_tw =  purrr::imap(
-        rts,
-        function(rt, cntry) {
-            tw <- best_tw$time_window[best_tw$country == cntry]
-            message("Best time window for ", cntry, " is ", tw)
-            rt[[tw]]
-        }
-     ),
-
-    plots = purrr::walk(
-        countries_considered,
-        function(cntry) {
-
-            projections_best_tw[[cntry]]$date <- as.Date(
-                projections_best_tw[[cntry]]$date
-            )
-
-            limits <- c(
-                min(incidence_df[[cntry]]$dates),
-                max(projections_best_tw[[cntry]]$date)
-            )
-
-
-            message("Country ", cntry)
+    plots = purrr::map(
+        names(tall_deaths),
+        function(z) {
+            x <- tall_deaths[[z]]
+            y <- qntls[[z]]
+            y$date <- as.Date(y$date)
+            y$si_distr <- factor(y$si_distr)
+            x <- as.data.frame(x)
 
             p <- ggplot() +
-                geom_col(
-                    data = incidence_df[[cntry]],
-                    aes(dates, counts)
-                )
-
-            p <- p +
-                geom_line(
-                    data = projections_best_tw[[cntry]],
-                    aes(date, `50%`)
-                ) +
-                geom_ribbon(
-                    data = projections_best_tw[[cntry]],
-                    aes(x = date, ymin = `2.5%`, ymax = `97.5%`),
-                    alpha = 0.3
-                ) + theme_classic() +
-                scale_x_date(limits = limits) +
+                geom_col(data = x, aes(dates, counts)) +
+                geom_line(data = y, aes(date, `50%`, col = si_distr)) +
+                geom_ribbon(data = y,
+                            aes(x = date,
+                                ymin = `2.5%`,
+                                ymax = `97.5%`,
+                                fill = si_distr
+                                ),
+                            alpha = 0.3) +
+                ggpubr::theme_pubr() +
                 xlab("") +
-                ylab("Daily Incidence") +
-                ggtitle(cntry)
-
-            rt <- rt_best_tw[[cntry]]
-            rt$date <- incidence_df[[cntry]]$dates[rt$t_start]
-            rt$date <- as.Date(rt$date)
-            rt_used <- tail(rt, 1)
-            rt_used <- rt_used[rep(seq_len(nrow(rt_used)), n_days), ]
-            rt_used$date <- seq(
-                from = tail(rt$date, 1) + 1,
-                length.out = n_days,
-                by = "1 day"
-            )
-            rt <- rbind(rt, rt_used)
-
-            p2 <- ggplot() +
-                geom_line(
-                    data = rt,
-                    aes(date, `Median(R)`)
-                ) +
-                geom_ribbon(
-                    data = rt,
-                    aes(x = date,
-                        ymin = `Quantile.0.025(R)`,
-                        ymax = `Quantile.0.975(R)`,
-                        ),
-                    alpha = 0.3
-                ) +
-                scale_x_date(limits = limits) +
-                theme_classic() +
-                xlab("") +
-                geom_hline(yintercept = 1, linetype = "dashed") +
-                ylim(0, 5)
-                ##expand_limits(y = 0)
-
-            p3 <- cowplot::plot_grid(
-                p, p2, nrow = 2, align="hv", rel_heights = c(2,1)
-            )
-
-            cowplot::save_plot(
-                filename = glue::glue("{cntry}.png"),
-                plot = p3
+                ylab("") + theme(legend.position = "none")
+            z <- snakecase::to_snake_case(z)
+            message(getwd())
+            ggsave(
+                filename = glue::glue("figures/{z}.png"),
+                p
             )
 
         }
+    ),
+    ## Reformat, 7 columns, 10000 rows, 1 df per country
+    ## can transpose trivially as these are matrices
+    projections_t = purrr::map(
+        projections, function(x) purrr::map(x, ~ t(.))
+    ),
 
+    ## Save in format required
+    out = readr::write_rds(
+        x = list(
+            I_active_transmission = raw_data[["I_active_transmission"]],
+            D_active_transmission = raw_data[["D_active_transmission"]],
+            Country = raw_data[["Country"]],
+            Rt_last = rt_samples,
+            Predictons = projections_t
+        ), path = file_out(outfile)
+     ),
+
+    ## apeestim
+    inftvty = purrr::map(
+        tall_deaths,
+        function(deaths) {
+            out <- purrr::map(
+                si_distrs,
+                function(si_distr) {
+                    incid <- as.numeric(incidence::get_counts(deaths))
+                    inftvty <- EpiEstim::overall_infectivity(
+                        incid, si_distr
+                        )
+                    inftvty
+                }
+                )
+            out
+        }
+    ),
+
+    r_apeestim = purrr::map(
+        names(tall_deaths),
+        function(country) {
+            deaths <- tall_deaths[[country]]
+            r_prior <- c(1, 5)
+            a <- 0.025
+            trunctime <- first_nonzero_incidence(deaths)
+            message("Truncating for ", country, " at ", trunctime)
+            out <- purrr::map(
+                si_distrs,
+                function(si_distr) {
+                    incid <- as.numeric(incidence::get_counts(deaths))
+                    inftvty <- EpiEstim::overall_infectivity(
+                        incid, si_distr
+                    )
+                    apeEstim(
+                        incid,
+                        si_distr,
+                        inftvty,
+                        r_prior,
+                        a,
+                        trunctime,
+                        country
+                   )
+                }
+             )
+            out
+        }
     )
-
 
 
 )
